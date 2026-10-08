@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qiskit-transpiler-autotune"
+version = "0.1.0"
+description = "Automatic per-circuit tuning of Qiskit transpiler passes (layout & routing)"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Aleksey Balandin" }]
+requires-python = ">=3.10"
+dependencies = [
+    "qiskit>=2.2",
+    "qiskit-ibm-runtime>=0.40",
+    "mqt.bench>=2.0",
+    "optuna>=4.0",
+    "pandas>=2.0",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+sim = ["qiskit-aer>=0.17"]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qta"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
