@@ -23,6 +23,31 @@ SUITE: list[tuple[str, int]] = [
     ("qwalk", 8),
 ]
 
+_SIZES = (6, 8, 10, 12, 16, 20, 24, 28, 32, 40)
+_MAX_SIZE = {
+    "qwalk": 8, "randomcircuit": 20, "multiplier": 24, "rg_qft_multiplier": 20,
+    "vqe_two_local": 32, "qv": 20,
+}
+_DATASET_FAMILIES = [
+    "qft", "qftentangled", "qpeexact", "qpeinexact", "qaoa", "graphstate", "vqe_two_local",
+    "vqe_real_amp", "randomcircuit", "hhl", "multiplier", "rg_qft_multiplier",
+    "cdkm_ripple_carry_adder", "modular_adder", "full_adder", "bv", "dj", "ghz", "wstate",
+    "qwalk", "qv",
+]
+
+# Larger and more varied set for learning which circuits are worth tuning. It also
+# keeps circuits that VF2 maps without SWAPs, since recognising them is part of the task.
+DATASET: list[tuple[str, int]] = [
+    (family, size)
+    for family in _DATASET_FAMILIES
+    for size in _SIZES
+    if size <= _MAX_SIZE.get(family, max(_SIZES))
+    and not (family == "multiplier" and size % 4)
+    and not (family == "rg_qft_multiplier" and size % 4)
+]
+
+SUITES = {"main": SUITE, "dataset": DATASET}
+
 # Benchmarks whose generator draws random numbers and accepts a seed.
 _SEEDED = {"graphstate"}
 _SEED = 42
@@ -38,6 +63,14 @@ def circuit_id(name: str, size: int) -> str:
 
 
 def generate(name: str, size: int) -> QuantumCircuit:
+    if name == "qv":
+        from qiskit.circuit.library import quantum_volume
+
+        qc = quantum_volume(size, seed=_SEED).decompose()
+        qc.measure_all()
+        qc.name = circuit_id(name, size)
+        return qc
+
     from mqt.bench import BenchmarkLevel, get_benchmark
 
     kwargs = {"seed": _SEED} if name in _SEEDED else {}
