@@ -20,7 +20,8 @@ uv pip install -e ".[dev,sim]"
 .venv/bin/python -m qta.random_search --out results/random --trials 40
 
 # comparison at an equal compile-time budget, tables and figures
-.venv/bin/python -m qta.analysis --baseline results/baseline --search results/random --out results/report
+.venv/bin/python -m qta.analysis --baseline results/baseline --search results/random --out results/report \
+    --objective esp   # or n2q
 ```
 
 Benchmark circuits come from MQT Bench and are cached as QPY in `<out>/circuits`
