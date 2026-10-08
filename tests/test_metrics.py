@@ -44,3 +44,22 @@ def test_counts_and_depth(target):
     assert m.depth_2q == 2
     assert m.depth == 3
     assert m.size == 5
+
+
+def test_depth_matches_qiskit_on_transpiled_circuits():
+    from qiskit.circuit.random import random_circuit
+    from qiskit.transpiler import generate_preset_pass_manager
+    from qiskit_ibm_runtime.fake_provider import FakeTorino
+
+    backend = FakeTorino()
+    pm = generate_preset_pass_manager(1, backend=backend, seed_transpiler=0)
+    for seed in range(5):
+        qc = random_circuit(6, 8, max_operands=2, measure=True, seed=seed)
+        qc.barrier()
+        out = pm.run(qc)
+        m = measure(out, backend.target)
+        def keep(i):
+            return i.operation.name not in ("barrier", "delay")
+        assert m.depth == out.depth(keep)
+        assert m.depth_2q == out.depth(lambda i: keep(i) and i.operation.num_qubits == 2)
+        assert m.n_2q == sum(1 for i in out.data if keep(i) and i.operation.num_qubits == 2)
