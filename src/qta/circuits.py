@@ -90,11 +90,22 @@ def load_suite(cache_dir: Path, suite=SUITE) -> dict[str, QuantumCircuit]:
         cid = circuit_id(name, size)
         path = cache_dir / f"{cid}.qpy"
         if not path.exists():
-            with path.open("wb") as f:
-                qpy.dump(generate(name, size), f)
+            _dump(generate(name, size), path)
         with path.open("rb") as f:
             circuits[cid] = qpy.load(f)[0]
     return circuits
+
+
+def _dump(qc: QuantumCircuit, path: Path) -> None:
+    with path.open("wb") as f:
+        qpy.dump(qc, f)
+    try:
+        with path.open("rb") as f:
+            qpy.load(f)
+    except TypeError:
+        # QPY cannot read back some multi-controlled phase gates; store their decomposition.
+        with path.open("wb") as f:
+            qpy.dump(qc.decompose(gates_to_decompose=["mcphase"]), f)
 
 
 def get_device(name: str):
