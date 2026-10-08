@@ -27,10 +27,18 @@ from sklearn.model_selection import LeaveOneGroupOut
 from qta.circuits import load_suite
 from qta.features import extract
 
+def _log_esp(runs: pd.DataFrame) -> pd.Series:
+    # A run through a coupler with error 1 has ESP 0; count it as the worst finite run
+    # of the pair so that one such seed does not make the headroom infinite.
+    finite = runs.log_esp[np.isfinite(runs.log_esp)]
+    return runs.log_esp.clip(lower=finite.min())
+
+
 OBJECTIVES = {
     # value whose larger is better
     "n2q": lambda runs: -np.log(runs.n_2q.clip(lower=1)),
-    "esp": lambda runs: runs.log_esp,
+    "esp": _log_esp,
+    "esp_abs": lambda runs: runs.esp,
 }
 
 
