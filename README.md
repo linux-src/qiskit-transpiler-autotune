@@ -6,9 +6,10 @@ two-qubit gate count and depth on noisy IBM devices.
 ## Setup
 
 ```bash
-uv venv .venv
-uv pip install -e ".[dev,sim]"
+uv sync --extra dev --extra sim
 ```
+
+`uv.lock` pins the package versions the experiments were run with.
 
 ## Experiments
 

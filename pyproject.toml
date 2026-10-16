@@ -9,7 +9,7 @@ description = "Automatic per-circuit tuning of Qiskit transpiler passes (layout 
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Aleksey Balandin" }]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "qiskit>=2.2",
     "qiskit-ibm-runtime>=0.40",
