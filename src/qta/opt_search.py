@@ -52,19 +52,21 @@ def main(argv=None) -> None:
 
     for device_name in args.devices:
         backend = get_device(device_name)
-        for cid, qc in circuits.items():
-            for seed in range(args.seeds):
-                for i, config in enumerate(configs):
+        for seed in range(args.seeds):
+            for i, config in enumerate(configs):
+                # Building the pass manager costs more than running it on a small circuit,
+                # and reusing it gives identical output, so build it once per configuration.
+                pm = build_pass_manager(config, backend, seed)
+                for cid, qc in circuits.items():
                     if log.has(device=device_name, circuit=cid, config=i, seed=seed):
                         continue
-                    pm = build_pass_manager(config, backend, seed)
                     try:
                         row = {**evaluate(qc, pm, backend.target), "error": ""}
                     except TranspilerError as exc:
                         row = {"error": str(exc)}
                     log.write({"device": device_name, "circuit": cid, "num_qubits": qc.num_qubits,
                                "config": i, "seed": seed, **row})
-            print(f"{device_name} {cid} done", flush=True)
+                print(f"{device_name} seed={seed} config={i} done", flush=True)
 
 
 if __name__ == "__main__":
