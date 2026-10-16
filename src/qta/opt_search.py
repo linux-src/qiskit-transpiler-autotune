@@ -14,13 +14,14 @@ import json
 from pathlib import Path
 
 import numpy as np
+from qiskit.transpiler.exceptions import TranspilerError
 
 from qta.baseline import METRICS
 from qta.circuits import DEVICES, SUITES, get_device, load_suite
 from qta.optimization import O3_OPTIMIZATION, build_pass_manager, sample
 from qta.runner import CsvLog, evaluate, write_environment
 
-FIELDS = ["device", "circuit", "num_qubits", "config", "seed", *METRICS]
+FIELDS = ["device", "circuit", "num_qubits", "config", "seed", *METRICS, "error"]
 
 
 def configurations(n: int, rng_seed: int = 0) -> list:
@@ -57,7 +58,10 @@ def main(argv=None) -> None:
                     if log.has(device=device_name, circuit=cid, config=i, seed=seed):
                         continue
                     pm = build_pass_manager(config, backend, seed)
-                    row = evaluate(qc, pm, backend.target)
+                    try:
+                        row = {**evaluate(qc, pm, backend.target), "error": ""}
+                    except TranspilerError as exc:
+                        row = {"error": str(exc)}
                     log.write({"device": device_name, "circuit": cid, "num_qubits": qc.num_qubits,
                                "config": i, "seed": seed, **row})
             print(f"{device_name} {cid} done", flush=True)

@@ -117,6 +117,10 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     runs = pd.read_csv(args.runs / "opt_search.csv")
+    failed = runs.error.notna()
+    if failed.any():
+        print(f"skipping {int(failed.sum())} failed runs")
+    runs = runs[~failed]
     control = pd.read_csv(args.control / "baseline.csv")
     control = control[control.level == 3]
     args.out.mkdir(parents=True, exist_ok=True)

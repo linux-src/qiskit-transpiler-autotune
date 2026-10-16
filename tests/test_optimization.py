@@ -49,3 +49,14 @@ def test_configurations_start_with_level3_and_are_unique():
     configs = configurations(12)
     assert configs[0] == O3_OPTIMIZATION
     assert len(set(configs)) == 12
+
+
+def test_fixed_point_loop_terminates_when_passes_oscillate():
+    backend = FakeSherbrooke()
+    # Resynthesis alone keeps rewriting the same blocks without the size settling.
+    config = OptimizationConfig(peephole=False, remove_identity=False, optimize_1q=False,
+                                commutative_cancellation=False, consolidate=True, loop="fixed_point")
+    qc = synth_qft_full(6)
+    qc.measure_all()
+    out = build_pass_manager(config, backend, seed=0).run(qc)
+    assert {inst.name for inst in out.data} - {"barrier"} <= set(backend.target.operation_names)

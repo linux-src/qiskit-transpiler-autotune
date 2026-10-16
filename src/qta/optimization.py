@@ -30,6 +30,9 @@ from qiskit.transpiler.preset_passmanagers import common, generate_preset_pass_m
 from qiskit.transpiler.preset_passmanagers.plugin import PassManagerStagePluginManager
 
 _PREFIX = "optimization_loop"
+# Some pass combinations never reach a fixed point (resynthesis and cancellation undo each
+# other), so the fixed-point loop is capped.
+MAX_FIXED_POINT_ITERATIONS = 20
 
 
 @dataclass(frozen=True)
@@ -77,7 +80,14 @@ def _loop_check(loop: str):
         return setup, lambda ps: not ps[f"{_PREFIX}_minimum_point"]
     if loop == "fixed_point":
         setup = [Size(recurse=True), Depth(recurse=True), FixedPoint("size"), FixedPoint("depth")]
-        return setup, lambda ps: not (ps["depth_fixed_point"] and ps["size_fixed_point"])
+
+        def not_fixed(ps):
+            ps["qta_loop_iterations"] = (ps["qta_loop_iterations"] or 0) + 1
+            if ps["qta_loop_iterations"] >= MAX_FIXED_POINT_ITERATIONS:
+                return False
+            return not (ps["depth_fixed_point"] and ps["size_fixed_point"])
+
+        return setup, not_fixed
     return [], lambda ps: False
 
 
