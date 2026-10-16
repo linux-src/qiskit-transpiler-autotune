@@ -12,5 +12,5 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: "3.12"
-      - run: uv sync --locked --extra dev
+      - run: uv sync --locked --extra dev --extra sim
       - run: uv run pytest
