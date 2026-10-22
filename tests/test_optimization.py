@@ -7,7 +7,10 @@ from qiskit.synthesis import synth_qft_full
 from qiskit.transpiler import generate_preset_pass_manager
 from qiskit_ibm_runtime.fake_provider import FakeSherbrooke, FakeTorino
 
-from qta.optimization import O3_OPTIMIZATION, OptimizationConfig, build_pass_manager, sample
+from qta.optimization import (
+    O3_OPTIMIZATION, SEQUENCE_PASSES, OptimizationConfig, PassSequence, build_pass_manager, sample,
+    sample_sequence,
+)
 from qta.opt_search import configurations
 
 BACKENDS = [FakeSherbrooke(), FakeTorino()]
@@ -60,3 +63,21 @@ def test_fixed_point_loop_terminates_when_passes_oscillate():
     qc.measure_all()
     out = build_pass_manager(config, backend, seed=0).run(qc)
     assert {inst.name for inst in out.data} - {"barrier"} <= set(backend.target.operation_names)
+
+
+def test_pass_sequences_preserve_unitary_and_basis():
+    backend = GenericBackendV2(5, coupling_map=[[0, 1], [1, 2], [2, 3], [3, 4]], seed=11)
+    qc = synth_qft_full(5)
+    rng = np.random.default_rng(5)
+    sequences = [sample_sequence(rng) for _ in range(6)] + [PassSequence(tuple(SEQUENCE_PASSES))]
+    basis = set(backend.target.operation_names)
+    for sequence in sequences:
+        out = build_pass_manager(sequence, backend, seed=2).run(qc)
+        assert {inst.name for inst in out.data} <= basis
+        assert Operator.from_circuit(out).equiv(Operator(qc))
+
+
+def test_sequence_configurations_start_with_level3():
+    configs = configurations(5, space="sequence")
+    assert configs[0] == O3_OPTIMIZATION
+    assert all(isinstance(c, PassSequence) for c in configs[1:])

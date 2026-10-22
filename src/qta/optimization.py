@@ -11,6 +11,7 @@ from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import (
     ApplyLayout,
     CommutativeCancellation,
+    CommutativeInverseCancellation,
     ConsolidateBlocks,
     ContractIdleWiresInControlFlow,
     Depth,
@@ -19,7 +20,10 @@ from qiskit.transpiler.passes import (
     InverseCancellation,
     MinimumPoint,
     Optimize1qGatesDecomposition,
+    Optimize1qGatesSimpleCommutation,
+    RemoveDiagonalGatesBeforeMeasure,
     RemoveIdentityEquivalent,
+    RemoveResetInZeroState,
     Size,
     TwoQubitPeepholeOptimization,
     UnitarySynthesis,
@@ -94,6 +98,8 @@ def _loop_check(loop: str):
 def optimization_stage(config: OptimizationConfig, pm_config: PassManagerConfig) -> PassManager:
     target = pm_config.target
     approx = pm_config.approximation_degree
+    if isinstance(config, PassSequence):
+        return sequence_stage(config, pm_config)
     loop = []
     if config.consolidate:
         loop += [ConsolidateBlocks(target=target, approximation_degree=approx),
@@ -131,6 +137,66 @@ def optimization_stage(config: OptimizationConfig, pm_config: PassManagerConfig)
                           strict_direction=True),
             ConditionalController(ApplyLayout(), condition=common._apply_post_layout_condition),
         ])
+    return stage
+
+
+# Passes of the optimization stage that keep the circuit unitary and its qubit
+# connectivity, so they may follow routing in any order (cf. the pass sequences tuned by
+# QuTuner). Each entry builds the passes from (pm_config, target, approximation degree).
+SEQUENCE_PASSES = {
+    "optimize_1q": lambda c, t, a: [Optimize1qGatesDecomposition(basis=c.basis_gates, target=t)],
+    "simple_commutation_1q": lambda c, t, a: [
+        Optimize1qGatesSimpleCommutation(basis=c.basis_gates, target=t)],
+    "commutative_cancellation": lambda c, t, a: [CommutativeCancellation(target=t)],
+    "inverse_cancellation": lambda c, t, a: [InverseCancellation()],
+    "commutative_inverse_cancellation": lambda c, t, a: [CommutativeInverseCancellation()],
+    "remove_identity": lambda c, t, a: [RemoveIdentityEquivalent(approximation_degree=a, target=t)],
+    "peephole": lambda c, t, a: [TwoQubitPeepholeOptimization(t, approximation_degree=a)],
+    "consolidate": lambda c, t, a: [ConsolidateBlocks(target=t, approximation_degree=a),
+                                    UnitarySynthesis(target=t, approximation_degree=a)],
+    "remove_diagonal_before_measure": lambda c, t, a: [RemoveDiagonalGatesBeforeMeasure()],
+    "remove_reset_in_zero": lambda c, t, a: [RemoveResetInZeroState()],
+}
+
+
+@dataclass(frozen=True)
+class PassSequence:
+    """Optimization stage as a fixed sequence of passes run once, then translation back to
+    the target basis and, as in level 3, VF2PostLayout."""
+
+    passes: tuple[str, ...]
+
+    def as_dict(self) -> dict:
+        return {"passes": list(self.passes)}
+
+
+def sample_sequence(rng: np.random.Generator, min_len: int = 3, max_len: int = 12) -> PassSequence:
+    names = list(SEQUENCE_PASSES)
+    length = int(rng.integers(min_len, max_len + 1))
+    return PassSequence(tuple(str(n) for n in rng.choice(names, size=length)))
+
+
+def sequence_stage(sequence: PassSequence, pm_config: PassManagerConfig) -> PassManager:
+    target = pm_config.target
+    approx = pm_config.approximation_degree
+    translation = PassManagerStagePluginManager().get_passmanager_stage(
+        "translation", pm_config.translation_method or "default", pm_config, optimization_level=3
+    )
+    stage = PassManager()
+    for name in sequence.passes:
+        stage.append(SEQUENCE_PASSES[name](pm_config, target, approx))
+    stage.append([
+        GatesInBasis(pm_config.basis_gates, target=target),
+        ConditionalController(
+            translation.to_flow_controller(), condition=lambda ps: not ps["all_gates_in_basis"]
+        ),
+    ])
+    call_limit, max_trials = common.get_vf2_limits(3, None, None, exact_match=True)
+    stage.append([
+        VF2PostLayout(target=target, seed=-1, call_limit=call_limit, max_trials=max_trials,
+                      strict_direction=True),
+        ConditionalController(ApplyLayout(), condition=common._apply_post_layout_condition),
+    ])
     return stage
 
 
