@@ -1,6 +1,8 @@
 import numpy as np
 
-from qta.adaptive import Pool, Replay, adaptive_ei, expected_improvement, static, successive_halving, uniform
+from qta.adaptive import (
+    Pool, Replay, adaptive_ei, by_cost_observed, expected_improvement, static, successive_halving, uniform,
+)
 
 
 def pools():
@@ -35,3 +37,19 @@ def test_uniform_and_gain():
     uniform(replay, 0.0, k=10)
     assert [s.taken for s in replay.states] == [10, 10, 10, 10]
     assert np.isclose(replay.gain(), (9 - 4.5) / 4)
+
+
+def test_by_cost_observed_prefers_cheap_circuits():
+    cheap = Pool(np.arange(10, dtype=float), np.full(10, 0.1))
+    dear = Pool(np.arange(10, dtype=float), np.full(10, 1.0))
+    replay = Replay([cheap, dear], np.random.default_rng(0))
+    by_cost_observed(replay, budget=2.0)
+    assert replay.states[0].taken > replay.states[1].taken
+    assert replay.spent <= 2.0 + 1.0
+
+
+def test_weighted_gain():
+    replay = Replay(pools(), np.random.default_rng(0))
+    uniform(replay, 0.0, k=10)
+    assert np.isclose(replay.gain(np.array([0.0, 0.0, 0.0, 1.0])), 4.5)
+    assert np.isclose(replay.gain(np.ones(4)), replay.gain())

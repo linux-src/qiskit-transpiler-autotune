@@ -7,7 +7,9 @@ asks for one more run of some circuit and receives the next run of that pool in 
 random order, so policies are replayed on real data without new transpilations.
 All policies get the same compile-time budget: the expected time of giving every
 circuit ``k`` seeds. Gain is the mean, over circuits, of the best value obtained
-minus the mean value of a single run.
+minus the mean value of a single run. With ``--weights`` the mean is weighted by the
+circuit's size (median two-qubit count) or compile time instead of counting every
+circuit once.
 """
 
 from __future__ import annotations
@@ -61,8 +63,9 @@ class Replay:
     def draw(self, i: int) -> None:
         self.spent += self.states[i].draw()
 
-    def gain(self) -> float:
-        return float(np.mean([max(s.seen) - s.pool.values.mean() for s in self.states]))
+    def gain(self, weights: np.ndarray | None = None) -> float:
+        return float(np.average([max(s.seen) - s.pool.values.mean() for s in self.states],
+                                weights=weights))
 
 
 def uniform(replay: Replay, budget: float, k: int, **_) -> None:
@@ -74,9 +77,25 @@ def uniform(replay: Replay, budget: float, k: int, **_) -> None:
 
 def static(replay: Replay, budget: float, priority: np.ndarray, **_) -> None:
     """Fixed priorities known in advance: one seed each, then greedily by priority / seeds."""
+    for i in range(len(replay.states)):
+        replay.draw(i)
+    _greedy(replay, budget, priority)
+
+
+def by_cost_observed(replay: Replay, budget: float, weights: np.ndarray | None = None,
+                     **_) -> None:
+    """``by_cost`` as it can be run in practice: a circuit's compile time is not known in
+    advance but taken from its own first seed."""
     states = replay.states
     for i in range(len(states)):
         replay.draw(i)
+    first_time = np.array([s.pool.times[s.order[0]] for s in states])
+    w = np.ones(len(states)) if weights is None else weights
+    _greedy(replay, budget, w / np.clip(first_time, 1e-9, None))
+
+
+def _greedy(replay: Replay, budget: float, priority: np.ndarray) -> None:
+    states = replay.states
     priority = np.clip(priority, 1e-12, None)
     score = np.array([-np.inf if s.exhausted else priority[i] for i, s in enumerate(states)])
     while replay.spent < budget:
@@ -174,21 +193,39 @@ def load_pools(runs: pd.DataFrame, objective: str) -> tuple[pd.DataFrame, list[P
     return pd.DataFrame(meta), pools
 
 
+WEIGHTS = ["equal", "n2q", "time"]
+
+
+def circuit_weights(m: pd.DataFrame, mean_times: np.ndarray, kind: str) -> np.ndarray | None:
+    if kind == "equal":
+        return None
+    w = m.n_2q.to_numpy(dtype=float) if kind == "n2q" else mean_times
+    w = np.clip(w, 1e-12, None)
+    return w / w.sum()
+
+
 def evaluate(meta: pd.DataFrame, pools: list[Pool], ks: list[int], reps: int,
-             seed: int = 0) -> pd.DataFrame:
+             seed: int = 0, weights: str = "equal") -> pd.DataFrame:
     rows = []
     for device, m in meta.groupby("device"):
         dev_pools = [pools[i] for i in m.index]
         mean_times = np.array([p.times.mean() for p in dev_pools])
+        w = circuit_weights(m, mean_times, weights)
+        ones = np.ones(len(m)) if w is None else w
         policies = {
             "uniform": (uniform, {}),
             "by_size": (static, {"priority": m.n_2q.to_numpy(dtype=float)}),
             "by_cost": (static, {"priority": 1.0 / mean_times}),
+            "by_cost_observed": (by_cost_observed, {}),
             "adaptive_ei": (adaptive_ei, {"warmup": 1, "probe_fraction": 0.25}),
             "adaptive_ei_w2": (adaptive_ei, {"warmup": 2}),
             "successive_halving": (successive_halving, {}),
-            "oracle": (static, {"priority": m.headroom.to_numpy() / mean_times}),
+            "oracle": (static, {"priority": ones * m.headroom.to_numpy() / mean_times}),
         }
+        if w is not None:
+            # the same rules aware of how much each circuit counts in the weighted mean
+            policies["by_cost_weighted"] = (static, {"priority": w / mean_times})
+            policies["by_cost_observed_weighted"] = (by_cost_observed, {"weights": w})
         for k in ks:
             budget = k * mean_times.sum()
             for name, (policy, kwargs) in policies.items():
@@ -197,7 +234,7 @@ def evaluate(meta: pd.DataFrame, pools: list[Pool], ks: list[int], reps: int,
                 for _ in range(reps):
                     replay = Replay(dev_pools, rng)
                     policy(replay, budget, k=k, **kwargs)
-                    gains.append(replay.gain())
+                    gains.append(replay.gain(w))
                     spent.append(replay.spent / budget)
                 rows.append({
                     "device": device, "seeds_per_circuit": k, "policy": name,
@@ -216,6 +253,7 @@ def main(argv=None) -> None:
     parser.add_argument("--min-esp", type=float, default=0.0)
     parser.add_argument("--k", type=int, nargs="+", default=[2, 3, 4, 6, 8])
     parser.add_argument("--reps", type=int, default=200)
+    parser.add_argument("--weights", choices=WEIGHTS, default="equal")
     args = parser.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -226,8 +264,9 @@ def main(argv=None) -> None:
         runs = runs[median_esp >= args.min_esp]
 
     meta, pools = load_pools(runs, args.objective)
-    result = evaluate(meta, pools, args.k, args.reps)
+    result = evaluate(meta, pools, args.k, args.reps, weights=args.weights)
     tag = args.objective + (f"_minesp{args.min_esp:g}" if args.min_esp > 0 else "")
+    tag += f"_w{args.weights}" if args.weights != "equal" else ""
     result.to_csv(args.out / f"adaptive_{tag}.csv", index=False)
 
     with pd.option_context("display.width", 200, "display.max_columns", 20):
