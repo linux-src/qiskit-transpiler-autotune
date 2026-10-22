@@ -46,7 +46,25 @@ DATASET: list[tuple[str, int]] = [
     and not (family == "rg_qft_multiplier" and size % 4)
 ]
 
-SUITES = {"main": SUITE, "dataset": DATASET}
+# Families that are not in DATASET, kept aside to check rules chosen on DATASET. Sizes follow
+# each generator's constraints; Grover above 10 qubits does not fit in memory.
+_HOLDOUT_SIZES = {
+    "ae": _SIZES,
+    "bmw_quark_cardinality": _SIZES,
+    "bmw_quark_copula": (6, 8, 10, 12, 16, 20, 24),
+    "draper_qft_adder": _SIZES,
+    "grover": (6, 8, 10),
+    "half_adder": (7, 11, 15, 21, 31),
+    "hrs_cumulative_multiplier": (9, 13, 17, 21),
+    "qnn": _SIZES,
+    "vbe_ripple_carry_adder": (10, 16, 28, 40),
+    "vqe_su2": _SIZES,
+}
+HOLDOUT: list[tuple[str, int]] = [
+    (family, size) for family, sizes in _HOLDOUT_SIZES.items() for size in sizes
+]
+
+SUITES = {"main": SUITE, "dataset": DATASET, "holdout": HOLDOUT}
 
 # Benchmarks whose generator draws random numbers and accepts a seed.
 _SEEDED = {"graphstate"}
@@ -55,6 +73,13 @@ _SEED = 42
 DEVICES = {
     "sherbrooke": fake_provider.FakeSherbrooke,
     "torino": fake_provider.FakeTorino,
+}
+# Devices not used while the methods were developed: a newer Heron, another Eagle, and an
+# older Falcon-era 127-qubit device with CX gates.
+HOLDOUT_DEVICES = {
+    "fez": fake_provider.FakeFez,
+    "brisbane": fake_provider.FakeBrisbane,
+    "washington": fake_provider.FakeWashingtonV2,
 }
 
 
@@ -109,4 +134,4 @@ def _dump(qc: QuantumCircuit, path: Path) -> None:
 
 
 def get_device(name: str):
-    return DEVICES[name]()
+    return {**DEVICES, **HOLDOUT_DEVICES}[name]()
