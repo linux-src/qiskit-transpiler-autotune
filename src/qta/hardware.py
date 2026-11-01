@@ -1,11 +1,13 @@
 """Does ESP rank compilations of a circuit the way a real IBM QPU does?
 
     python -m qta.hardware submit --backend ibm_fez --out results/hw/run1 --circuits-dir results/circuits
+    python -m qta.hardware send --out results/hw/run1
     python -m qta.hardware collect --out results/hw/run1
 
 ``submit`` compiles every small circuit with level 3 and many seeds against the live
 calibration of the backend, keeps circuits whose ESP differs noticeably between seeds,
-and sends a few compilations per circuit (spread over the ESP range) as one Sampler job.
+and plans a few compilations per circuit (spread over the ESP range) for one Sampler job;
+``send`` submits them.
 ``collect`` fetches the counts and compares ESP with the Hellinger fidelity to the ideal
 output distribution. With ``--dry-run`` the backend is a fake snapshot and the job runs
 locally on Aer, so the whole pipeline can be checked without spending QPU time.
@@ -116,17 +118,33 @@ def submit(args) -> None:
         (out_dir / "calibration.json").write_text(
             json.dumps(backend.properties().to_dict(), default=str))
 
-    if not args.yes:
-        if input("Submit? [y/N] ").strip().lower() != "y":
-            return
-    job = SamplerV2(mode=backend).run(compiled, shots=args.shots)
-    meta = {"job_id": job.job_id(), "backend": backend.name, "shots": args.shots,
+    if args.yes:
+        send(out_dir, backend, args.shots, args.dry_run)
+    else:
+        print(f"review {out_dir / 'plan.csv'}, then: python -m qta.hardware send --out {out_dir}")
+
+
+def send(out_dir: Path, backend, shots: int, dry_run: bool = False) -> None:
+    with (out_dir / "submitted.qpy").open("rb") as f:
+        compiled = qpy.load(f)
+    job = SamplerV2(mode=backend).run(compiled, shots=shots)
+    meta = {"job_id": job.job_id(), "backend": backend.name, "shots": shots,
             "submitted": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "dry_run": args.dry_run}
+            "dry_run": dry_run}
     (out_dir / "job.json").write_text(json.dumps(meta, indent=2))
     print(f"job {meta['job_id']} submitted")
-    if args.dry_run:
+    if dry_run:
         evaluate(out_dir, job.result())
+
+
+def send_planned(args) -> None:
+    env = json.loads((args.out / "environment.json").read_text())
+    planned = env["args"]
+    if planned["dry_run"]:
+        backend = get_device(planned["backend"])
+    else:
+        backend = QiskitRuntimeService().backend(planned["backend"])
+    send(args.out, backend, planned["shots"], planned["dry_run"])
 
 
 def evaluate(out_dir: Path, result) -> None:
@@ -175,8 +193,12 @@ def main(argv=None) -> None:
     p.add_argument("--min-ratio", type=float, default=1.1, help="best/worst ESP across seeds")
     p.add_argument("--shots", type=int, default=4000)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--yes", action="store_true", help="submit without asking")
+    p.add_argument("--yes", action="store_true", help="send the job right after planning")
     p.set_defaults(func=submit)
+
+    t = sub.add_parser("send", help="send a job planned by submit")
+    t.add_argument("--out", type=Path, required=True)
+    t.set_defaults(func=send_planned)
 
     c = sub.add_parser("collect")
     c.add_argument("--out", type=Path, required=True)
