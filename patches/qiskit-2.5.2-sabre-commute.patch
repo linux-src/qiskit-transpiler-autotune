@@ -1,0 +1,650 @@
+diff --git a/crates/transpiler/src/passes/sabre/dag.rs b/crates/transpiler/src/passes/sabre/dag.rs
+index 0343e98..b2e7190 100644
+--- a/crates/transpiler/src/passes/sabre/dag.rs
++++ b/crates/transpiler/src/passes/sabre/dag.rs
+@@ -18,6 +18,7 @@ use thiserror::Error;
+ use qiskit_circuit::dag_circuit::{DAGCircuit, NodeType, Wire};
+ use qiskit_circuit::operations::ControlFlowView;
+ use qiskit_circuit::operations::Operation;
++use qiskit_circuit::operations::StandardGate;
+ use qiskit_circuit::packed_instruction::PackedOperation;
+ use qiskit_circuit::{Qubit, VirtualQubit};
+ 
+@@ -68,6 +69,43 @@ impl InteractionKind {
+     }
+ }
+ 
++/// The axis a gate acts along on one of its qubits.  Two gates commute if they act along the same
++/// axis on every qubit they share.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Axis {
++    X,
++    Y,
++    Z,
++}
++
++/// The axis of a standard gate on its (one or two) qubits, if it has one.
++fn gate_axes(gate: StandardGate) -> [Option<Axis>; 2] {
++    use Axis::*;
++    use StandardGate as G;
++    match gate {
++        G::Z | G::S | G::Sdg | G::T | G::Tdg | G::RZ | G::Phase | G::U1 => [Some(Z), None],
++        G::X | G::SX | G::SXdg | G::RX => [Some(X), None],
++        G::Y | G::RY => [Some(Y), None],
++        G::CZ | G::CPhase | G::CRZ | G::CU1 | G::CS | G::CSdg | G::RZZ => [Some(Z), Some(Z)],
++        G::CX | G::CSX | G::CRX | G::RZX => [Some(Z), Some(X)],
++        G::CY | G::CRY => [Some(Z), Some(Y)],
++        G::RXX => [Some(X), Some(X)],
++        G::RYY => [Some(Y), Some(Y)],
++        _ => [None, None],
++    }
++}
++
++/// What the commutation-aware construction of [SabreDAG] remembers about one wire.
++#[derive(Default)]
++struct WireState {
++    /// The axis shared by every node in `group`, or `None` if nothing can join the group.
++    axis: Option<Axis>,
++    /// The latest nodes on the wire.  They commute with each other on this wire.
++    group: Vec<NodeIndex>,
++    /// The group before `group`, which any newcomer to `group` must wait for.
++    before: Vec<NodeIndex>,
++}
++
+ /// Named access to the node elements in the [SabreDAG].
+ #[derive(Clone, Debug)]
+ pub struct SabreNode {
+@@ -121,7 +159,101 @@ pub struct SabreDAG {
+ }
+ 
+ impl SabreDAG {
++    /// Build the routing problem where gates depend only on gates they may not commute with.
++    ///
++    /// A qubit can then be active in several gates of the front layer at once, and the router
++    /// chooses their order from the current layout.
++    fn from_dag_commuting(dag: &DAGCircuit) -> Result<Self, SabreDAGError> {
++        let mut initial = Vec::<NodeIndex>::new();
++        let mut sabre = DiGraph::<SabreNode, ()>::new();
++        let mut first_layer = Vec::<NodeIndex>::new();
++        let mut wires: HashMap<Wire, WireState> = HashMap::with_capacity(dag.width());
++
++        for dag_node in dag.topological_op_nodes(false) {
++            let NodeType::Operation(inst) = &dag[dag_node] else {
++                panic!("op nodes should always be of type `Operation`");
++            };
++            let qargs = dag.get_qargs(inst.qubits);
++            let kind = if let Some(cf) = dag.try_view_control_flow(inst) {
++                InteractionKind::from_control_flow(cf)?
++            } else {
++                InteractionKind::from_op(&inst.op, qargs)?
++            };
++            let axes = match inst.op.try_standard_gate() {
++                Some(gate) if dag.get_cargs(inst.clbits).is_empty() => gate_axes(gate),
++                _ => [None, None],
++            };
++            let node_wires: Vec<(Wire, Option<Axis>)> = dag
++                .dag()
++                .edges_directed(dag_node, Direction::Incoming)
++                .map(|edge| {
++                    let wire = *edge.weight();
++                    let axis = match wire {
++                        Wire::Qubit(qubit) if qargs.len() <= 2 => qargs
++                            .iter()
++                            .position(|q| *q == qubit)
++                            .and_then(|position| axes[position]),
++                        _ => None,
++                    };
++                    (wire, axis)
++                })
++                .collect();
++
++            // A single-qubit gate needs no routing of its own, so it is attached to a neighbouring
++            // node whenever that keeps it correctly ordered.
++            if let (InteractionKind::Synchronize, [(wire, axis)]) = (&kind, node_wires.as_slice()) {
++                let state = wires.entry(*wire).or_default();
++                if state.group.is_empty() {
++                    initial.push(dag_node);
++                    continue;
++                }
++                if axis.is_some() && *axis == state.axis {
++                    // It commutes with the whole group, so any member can carry it.
++                    let last = *state.group.last().expect("group checked to be non-empty");
++                    sabre[last].indices.push(dag_node);
++                    continue;
++                }
++                if let [only] = state.group.as_slice() {
++                    let only = *only;
++                    sabre[only].indices.push(dag_node);
++                    state.axis = None;
++                    continue;
++                }
++            }
++
++            let sabre_node = sabre.add_node(SabreNode::new(dag_node, kind));
++            let mut needed = Vec::<NodeIndex>::new();
++            for (wire, axis) in node_wires {
++                let state = wires.entry(wire).or_default();
++                if axis.is_some() && axis == state.axis {
++                    needed.extend(state.before.iter().copied());
++                    state.group.push(sabre_node);
++                } else {
++                    needed.extend(state.group.iter().copied());
++                    state.before = std::mem::replace(&mut state.group, vec![sabre_node]);
++                    state.axis = axis;
++                }
++            }
++            needed.sort_unstable();
++            needed.dedup();
++            if needed.is_empty() {
++                first_layer.push(sabre_node);
++            }
++            for parent in needed {
++                sabre.add_edge(parent, sabre_node, ());
++            }
++        }
++        Ok(SabreDAG {
++            initial,
++            dag: sabre,
++            first_layer,
++        })
++    }
++
+     pub fn from_dag(dag: &DAGCircuit) -> Result<Self, SabreDAGError> {
++        if std::env::var_os("QTA_SABRE_COMMUTE").is_some() {
++            return Self::from_dag_commuting(dag);
++        }
+         // The `NodeIndex` here is into `dag`.
+         let mut initial = Vec::<NodeIndex>::new();
+         let mut sabre = DiGraph::new();
+diff --git a/crates/transpiler/src/passes/sabre/layer.rs b/crates/transpiler/src/passes/sabre/layer.rs
+index 76e65e3..02128dc 100644
+--- a/crates/transpiler/src/passes/sabre/layer.rs
++++ b/crates/transpiler/src/passes/sabre/layer.rs
+@@ -13,6 +13,7 @@
+ use ndarray::prelude::*;
+ use rustworkx_core::petgraph::graph::IndexType;
+ use rustworkx_core::petgraph::prelude::*;
++use smallvec::SmallVec;
+ use std::num::NonZero;
+ 
+ use super::vec_map::VecMap;
+@@ -60,13 +61,6 @@ impl Layers {
+         &self.layers
+     }
+ 
+-    #[inline]
+-    pub fn apply_swap(&mut self, swap: [PhysicalQubit; 2]) {
+-        for layer in self.layers.iter_mut() {
+-            layer.apply_swap(swap);
+-        }
+-    }
+-
+     /// Set the layer of a given node.
+     ///
+     /// This removes the node from any layer it may already be in.
+@@ -76,14 +70,13 @@ impl Layers {
+         layer: u16,
+         node: NodeIndex,
+         qubits: [VirtualQubit; 2],
+-        layout: &NLayout,
+     ) {
+         if let Some(Location { layer, position }) = self.locations[node] {
+-            if let Some(moved) = self.layers[layer as usize].remove(position, layout) {
++            if let Some(moved) = self.layers[layer as usize].remove(position) {
+                 self.locations[moved] = Some(Location { layer, position });
+             }
+         }
+-        let position = self.layers[layer as usize].insert(node, qubits, layout);
++        let position = self.layers[layer as usize].insert(node, qubits);
+         self.locations[node] = Some(Location { layer, position });
+     }
+ 
+@@ -91,9 +84,9 @@ impl Layers {
+     ///
+     /// Returns the layer the node was in, if any.
+     #[inline]
+-    pub fn remove(&mut self, node: NodeIndex, layout: &NLayout) -> Option<u16> {
++    pub fn remove(&mut self, node: NodeIndex) -> Option<u16> {
+         let Location { layer, position } = self.locations[node].take()?;
+-        if let Some(moved) = self.layers[layer as usize].remove(position, layout) {
++        if let Some(moved) = self.layers[layer as usize].remove(position) {
+             self.locations[moved] = Some(Location { layer, position });
+         }
+         Some(layer)
+@@ -116,29 +109,20 @@ struct Location {
+ 
+ /// A container for the current non-routable parts of a layer.  This only ever holds two-qubit
+ /// gates, which are the only ones that contribute to routing costs.
++///
++/// A qubit may be active in several gates at once: when the dependency graph takes commutation
++/// into account, gates sharing a qubit can be in the layer together.
+ #[derive(Clone, Debug)]
+ pub struct Layer {
+-    /// The qubits that each stored gate in the layer is active on.  For any given pair of qubits
+-    /// making up a gate in the layer, all three equalities hold:
+-    ///
+-    /// ```
+-    /// let virtuals: [VirtualQubit; 2];
+-    /// let physicals = virtuals.map(|q| layout[q]);
+-    /// physicals[0] == layer.other[physicals[1]];
+-    /// physicals[1] == layer.other[physicals[0]];
+-    /// layer.node[virtuals[0]] == layer.node[virtuals[1]];
+-    /// ```
++    /// The qubits that each stored gate in the layer is active on.
+     ///
+     /// The indexing into this `Vec` is arbitrary but deterministic for a given input and random
+     /// seed.  The indexing is tracked by [Layers::locations].
+     gates: Vec<[VirtualQubit; 2]>,
+-    /// If a given qubit is active in the layer, `other[qubit]` will be the other `PhysicalQubit` in
+-    /// the corresponding gate.  If the qubit is not active, the maximum physical qubit is stored
+-    /// (we assume you don't use the absolute maximum).
+-    other: VecMap<PhysicalQubit, PhysicalQubit>,
+-    /// If a given qubit is active in the layer, the corresponding `node` will be the [SabreDAG]
+-    /// node corresponding to its gate.  If not active, the maximum node index is stored.
+-    node: VecMap<VirtualQubit, NodeIndex>,
++    /// The [SabreDAG] node of each gate, at the same position as in `gates`.
++    nodes: Vec<NodeIndex>,
++    /// Positions in `gates` of the gates active on each qubit.
++    on: VecMap<VirtualQubit, SmallVec<[u32; 2]>>,
+ }
+ 
+ impl Layer {
+@@ -147,28 +131,9 @@ impl Layer {
+         assert!(num_qubits < <PhysicalQubit as IndexType>::max().index() as u32);
+         Layer {
+             gates: Vec::with_capacity(num_qubits as usize / 2),
+-            other: vec![IndexType::max(); num_qubits as usize].into(),
+-            node: vec![IndexType::max(); num_qubits as usize].into(),
+-        }
+-    }
+-
+-    /// Apply a physical swap to the current layout data structure.
+-    #[inline]
+-    fn apply_swap(&mut self, swap: [PhysicalQubit; 2]) {
+-        if self.other[swap[0]] == swap[1] {
+-            // The two qubits of the swap are both involved in the gate in this layer, so nothing
+-            // actually changes; they're both still each other's "other".
+-            return;
+-        }
+-        if let Some(other) = self.other_qubit(swap[0]) {
+-            debug_assert_eq!(self.other[other], swap[0]);
+-            self.other[other] = swap[1];
++            nodes: Vec::with_capacity(num_qubits as usize / 2),
++            on: vec![SmallVec::new(); num_qubits as usize].into(),
+         }
+-        if let Some(other) = self.other_qubit(swap[1]) {
+-            debug_assert_eq!(self.other[other], swap[1]);
+-            self.other[other] = swap[0];
+-        }
+-        self.other.swap(swap[0], swap[1]);
+     }
+ 
+     /// Number of gates currently stored in the layer.
+@@ -181,18 +146,13 @@ impl Layer {
+     ///
+     /// Returns the location into its tracking vector that the gate was inserted at.
+     #[inline]
+-    fn insert(&mut self, index: NodeIndex, qubits: [VirtualQubit; 2], layout: &NLayout) -> u32 {
+-        let [a, b] = qubits;
+-        debug_assert_eq!(self.other[layout[a]], IndexType::max());
+-        debug_assert_eq!(self.other[layout[b]], IndexType::max());
+-        debug_assert_eq!(self.node[a], IndexType::max());
+-        debug_assert_eq!(self.node[b], IndexType::max());
+-        self.other[layout[a]] = layout[b];
+-        self.other[layout[b]] = layout[a];
+-        self.node[a] = index;
+-        self.node[b] = index;
++    fn insert(&mut self, index: NodeIndex, qubits: [VirtualQubit; 2]) -> u32 {
++        let position = self.gates.len() as u32;
+         self.gates.push(qubits);
+-        self.gates.len() as u32 - 1
++        self.nodes.push(index);
++        self.on[qubits[0]].push(position);
++        self.on[qubits[1]].push(position);
++        position
+     }
+ 
+     /// Remove a node from the layer, given by position into the tracking vector.
+@@ -200,57 +160,72 @@ impl Layer {
+     /// Returns the node that is now in this location in the tracking vector, if any.
+     #[must_use]
+     #[inline]
+-    fn remove(&mut self, location: u32, layout: &NLayout) -> Option<NodeIndex> {
+-        let replacement = if location as usize + 1 == self.len() {
+-            None
+-        } else {
+-            self.gates.last().map(|[a, _]| self.node[*a])
+-        };
+-        let [a, b] = self.gates.swap_remove(location as usize);
+-        debug_assert_eq!(self.other[layout[a]], layout[b]);
+-        debug_assert_eq!(self.other[layout[b]], layout[a]);
+-        self.other[layout[a]] = IndexType::max();
+-        self.other[layout[b]] = IndexType::max();
+-        self.node[a] = IndexType::max();
+-        self.node[b] = IndexType::max();
+-        replacement
+-    }
+-
+-    /// Get the node index of an active qubit.
+-    #[inline]
+-    pub fn node_of(&self, qubit: VirtualQubit) -> Option<NodeIndex> {
+-        (self.node[qubit] != IndexType::max()).then_some(self.node[qubit])
++    fn remove(&mut self, location: u32) -> Option<NodeIndex> {
++        let last = self.gates.len() as u32 - 1;
++        for qubit in self.gates[location as usize] {
++            let list = &mut self.on[qubit];
++            let at = list
++                .iter()
++                .position(|&p| p == location)
++                .expect("a stored gate is listed on its qubits");
++            list.swap_remove(at);
++        }
++        self.gates.swap_remove(location as usize);
++        self.nodes.swap_remove(location as usize);
++        if location == last {
++            return None;
++        }
++        for qubit in self.gates[location as usize] {
++            let list = &mut self.on[qubit];
++            let at = list
++                .iter()
++                .position(|&p| p == last)
++                .expect("a stored gate is listed on its qubits");
++            list[at] = location;
++        }
++        Some(self.nodes[location as usize])
+     }
+ 
+-    /// Get the pair of the given qubit, if it's active in the layer.
++    /// The gates active on a qubit, as their node and the other qubit of the gate.
+     #[inline]
+-    pub fn other_qubit(&self, qubit: PhysicalQubit) -> Option<PhysicalQubit> {
+-        (self.other[qubit] != IndexType::max()).then_some(self.other[qubit])
++    pub fn iter_on(
++        &self,
++        qubit: VirtualQubit,
++    ) -> impl Iterator<Item = (NodeIndex, VirtualQubit)> + '_ {
++        self.on[qubit].iter().map(move |&position| {
++            let [a, b] = self.gates[position as usize];
++            (self.nodes[position as usize], if a == qubit { b } else { a })
++        })
+     }
+ 
+     /// Query whether a qubit has an active node.
+     #[inline]
+-    pub fn is_active(&self, qubit: PhysicalQubit) -> bool {
+-        self.other_qubit(qubit).is_some()
++    pub fn is_active(&self, qubit: VirtualQubit) -> bool {
++        !self.on[qubit].is_empty()
+     }
+ 
+     /// Calculate the score _difference_ caused by this swap, compared to not making the swap.
+     #[inline]
+-    pub fn score(&self, swap: [PhysicalQubit; 2], dist: &ArrayView2<f64>) -> f64 {
++    pub fn score(
++        &self,
++        swap: [PhysicalQubit; 2],
++        layout: &NLayout,
++        dist: &ArrayView2<f64>,
++    ) -> f64 {
+         let [a, b] = swap;
+-        let score = |cur: PhysicalQubit, new: PhysicalQubit| {
+-            let other = self.other[cur];
+-            if other == IndexType::max() {
+-                0.0
+-            } else {
+-                dist[[other.index(), new.index()]] - dist[[other.index(), cur.index()]]
++        let (virtual_a, virtual_b) = (layout[a], layout[b]);
++        let side = |moving: VirtualQubit, partner: VirtualQubit, cur: PhysicalQubit, new: PhysicalQubit| {
++            let mut delta = 0.0;
++            for (_, other) in self.iter_on(moving) {
++                // A gate on both qubits of the swap keeps its distance.
++                if other != partner {
++                    let other = layout[other];
++                    delta += dist[[other.index(), new.index()]] - dist[[other.index(), cur.index()]];
++                }
+             }
++            delta
+         };
+-        if self.other[a] == b {
+-            0.0
+-        } else {
+-            score(a, b) + score(b, a)
+-        }
++        side(virtual_a, virtual_b, a, b) + side(virtual_b, virtual_a, b, a)
+     }
+ 
+     /// Calculate the total absolute score of the layer for the set layout.
+@@ -270,13 +245,11 @@ impl Layer {
+ 
+     /// Iterator over gates and the qubits they act on.
+     pub fn iter_gates(&self) -> impl ExactSizeIterator<Item = (NodeIndex, [VirtualQubit; 2])> + '_ {
+-        self.gates
+-            .iter()
+-            .copied()
+-            .map(|qubits| (self.node[qubits[0]], qubits))
++        self.nodes.iter().copied().zip(self.gates.iter().copied())
+     }
+ 
+-    /// Iterator over the qubits that have active nodes on them.
++    /// Iterator over the qubits that have active nodes on them.  A qubit active in several gates
++    /// appears once per gate.
+     pub fn iter_active<'a>(
+         &'a self,
+         layout: &'a NLayout,
+diff --git a/crates/transpiler/src/passes/sabre/route.rs b/crates/transpiler/src/passes/sabre/route.rs
+index 93d5dae..a2e8ad8 100644
+--- a/crates/transpiler/src/passes/sabre/route.rs
++++ b/crates/transpiler/src/passes/sabre/route.rs
+@@ -588,6 +588,10 @@ struct State {
+     /// Reusable allocated storage space for tracking the current best swaps.  This is owned as
+     /// part of the general state to avoid reallocation costs.
+     best_swaps: Vec<[PhysicalQubit; 2]>,
++    /// Which physical qubits were already considered while collecting candidate swaps, as the
++    /// number of the collection round that last saw them.
++    candidate_round: VecMap<PhysicalQubit, u32>,
++    round: u32,
+     rng: Pcg64Mcg,
+     seed: u64,
+ }
+@@ -636,7 +640,7 @@ impl State {
+                     &mut predecessors[0],
+                     |satisfied| visit.push_back(satisfied),
+                 ),
+-                Err(qubits) => layers.insert(0, node, qubits, &layout),
++                Err(qubits) => layers.insert(0, node, qubits),
+             }
+         }
+ 
+@@ -667,7 +671,7 @@ impl State {
+                         );
+                     }
+                     InteractionKind::TwoQ(qubits) => {
+-                        layers.insert(num_layer, node, *qubits, &layout)
++                        layers.insert(num_layer, node, *qubits)
+                     }
+                 }
+             }
+@@ -683,6 +687,8 @@ impl State {
+             reached_previous_layer: Vec::new(),
+             swap_scores: Vec::with_capacity(problem.target.neighbors.edge_count() / 2),
+             best_swaps: Vec::new(),
++            candidate_round: vec![0; num_qubits as usize].into(),
++            round: 0,
+             rng: Pcg64Mcg::seed_from_u64(seed),
+             seed,
+         };
+@@ -693,28 +699,26 @@ impl State {
+     /// layout).
+     #[inline]
+     fn apply_swap(&mut self, swap: [PhysicalQubit; 2]) {
+-        self.layers.apply_swap(swap);
+         self.layout.swap_physical(swap[0], swap[1]);
+     }
+ 
+-    /// Return the node, if any, that is on this qubit and is routable with the current layout.
++    /// Return the nodes that are on this qubit and are routable with the current layout.
+     #[inline]
+-    fn routable_node_on_qubit(
+-        &self,
+-        problem: RoutingProblem,
++    fn routable_nodes_on_qubit<'a>(
++        &'a self,
++        problem: RoutingProblem<'a>,
+         qubit: PhysicalQubit,
+-    ) -> Option<NodeIndex> {
+-        let front = self.layers.front();
+-        let other = front.other_qubit(qubit)?;
+-        problem
+-            .target
+-            .neighbors
+-            .contains_edge(qubit, other)
+-            .then_some(
+-                front
+-                    .node_of(self.layout[qubit])
+-                    .expect("already checked qubit is active"),
+-            )
++    ) -> impl Iterator<Item = NodeIndex> + 'a {
++        self.layers
++            .front()
++            .iter_on(self.layout[qubit])
++            .filter_map(move |(node, other)| {
++                problem
++                    .target
++                    .neighbors
++                    .contains_edge(qubit, self.layout[other])
++                    .then_some(node)
++            })
+     }
+ 
+     /// Update the topological frontiers of each layer caused by the given front-layer nodes
+@@ -735,7 +739,7 @@ impl State {
+         // fully initialised.
+         for &node in nodes {
+             assert_eq!(
+-                self.layers.remove(node, &self.layout),
++                self.layers.remove(node),
+                 Some(0),
+                 "only nodes in the front layer can begin a routing update",
+             );
+@@ -759,7 +763,7 @@ impl State {
+         while let Some(node) = self.visit.pop_front() {
+             if self.layers.num_layers().get() > 1 {
+                 if let InteractionKind::TwoQ(_) = &sabre_dag[node].kind {
+-                    self.layers.remove(node, &self.layout);
++                    self.layers.remove(node);
+                     self.reached_previous_layer.push(node);
+                 }
+             }
+@@ -778,7 +782,7 @@ impl State {
+                     |satisfied| self.visit.push_back(satisfied),
+                 ),
+                 Err(qubits) => {
+-                    self.layers.insert(0, node, qubits, &self.layout);
++                    self.layers.insert(0, node, qubits);
+                 }
+             }
+         }
+@@ -812,7 +816,7 @@ impl State {
+                         });
+                     }
+                     InteractionKind::TwoQ(qubits) => {
+-                        self.layers.insert(num_layer, node, *qubits, &self.layout);
++                        self.layers.insert(num_layer, node, *qubits);
+                         if num_layer < self.layers.num_layers().get() - 1 {
+                             self.reached_previous_layer.push(node);
+                         }
+@@ -881,7 +885,7 @@ impl State {
+         match current_swaps.as_slice() {
+             [swap] => swap
+                 .iter()
+-                .filter_map(|q| self.routable_node_on_qubit(problem, *q))
++                .flat_map(|q| self.routable_nodes_on_qubit(problem, *q))
+                 .collect(),
+             _ => smallvec![closest_node],
+         }
+@@ -894,9 +898,14 @@ impl State {
+         // heuristic), and if it involves two active qubits, we choose the `swap[0] < swap[1]` form
+         // to make a canonical choice.
+         self.swap_scores.clear();
++        self.round += 1;
+         for phys in self.layers.front().iter_active(&self.layout) {
++            if self.candidate_round[phys] == self.round {
++                continue;
++            }
++            self.candidate_round[phys] = self.round;
+             for &neighbor in problem.target.neighbors[phys].iter() {
+-                if neighbor > phys || !self.layers.front().is_active(neighbor) {
++                if neighbor > phys || !self.layers.front().is_active(self.layout[neighbor]) {
+                     self.swap_scores.push(([phys, neighbor], 0.0));
+                 }
+             }
+@@ -919,7 +928,7 @@ impl State {
+             };
+             absolute_score += weight * front.total_score(&self.layout, dist);
+             for (swap, score) in self.swap_scores.iter_mut() {
+-                *score += weight * front.score(*swap, dist);
++                *score += weight * front.score(*swap, &self.layout, dist);
+             }
+         }
+ 
+@@ -937,7 +946,7 @@ impl State {
+                 };
+                 absolute_score += weight * layer.total_score(&self.layout, dist);
+                 for (swap, score) in self.swap_scores.iter_mut() {
+-                    *score += weight * layer.score(*swap, dist);
++                    *score += weight * layer.score(*swap, &self.layout, dist);
+                 }
+             }
+         }
+@@ -1048,14 +1057,12 @@ pub fn swap_map_trial<'a>(
+             let best_swap = state.choose_best_swap(problem);
+             state.apply_swap(best_swap);
+             current_swaps.push(best_swap);
+-            // These two nodes can't be the same; if they are, then the gate is on both qubits of
+-            // the swap, and so it would have been routable before we applied the swap too, i.e.
+-            // during the last iteration of the loop.
+-            if let Some(node) = state.routable_node_on_qubit(problem, best_swap[1]) {
+-                routable_nodes.push(node);
+-            }
+-            if let Some(node) = state.routable_node_on_qubit(problem, best_swap[0]) {
+-                routable_nodes.push(node);
++            for qubit in [best_swap[1], best_swap[0]] {
++                for node in state.routable_nodes_on_qubit(problem, qubit) {
++                    if !routable_nodes.contains(&node) {
++                        routable_nodes.push(node);
++                    }
++                }
+             }
+             if let Some(DecayHeuristic { increment, reset }) = problem.heuristic.decay {
+                 num_search_steps += 1;
+@@ -1077,7 +1084,11 @@ pub fn swap_map_trial<'a>(
+                 .rev()
+                 .for_each(|swap| state.apply_swap(swap));
+             let force_routed = state.force_enable_closest_node(problem, &mut current_swaps);
+-            routable_nodes.extend(force_routed);
++            for node in force_routed {
++                if !routable_nodes.contains(&node) {
++                    routable_nodes.push(node);
++                }
++            }
+         }
+         state.update_route(problem, &mut order, &routable_nodes, Some(current_swaps));
+ 
+diff --git a/crates/transpiler/src/passes/sabre/vec_map.rs b/crates/transpiler/src/passes/sabre/vec_map.rs
+index 552f587..eec8c3b 100644
+--- a/crates/transpiler/src/passes/sabre/vec_map.rs
++++ b/crates/transpiler/src/passes/sabre/vec_map.rs
+@@ -26,12 +26,6 @@ pub struct VecMap<Idx: IndexType, T> {
+     data: Box<[T]>,
+ }
+ impl<Idx: IndexType, T> VecMap<Idx, T> {
+-    /// Swap the values of two indices.
+-    #[inline]
+-    pub fn swap(&mut self, a: Idx, b: Idx) {
+-        self.data.swap(a.index(), b.index())
+-    }
+-
+     /// Fill all entries in the slice with a given value.
+     #[inline]
+     pub fn fill(&mut self, val: T)
