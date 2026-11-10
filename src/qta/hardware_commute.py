@@ -37,14 +37,24 @@ from qta.runner import write_environment
 MODES = ("off", "on")
 
 
+def mode_name() -> str:
+    """Directory of a compile run, from the switches of the patched SABRE core."""
+    absorb = bool(os.environ.get("QTA_SABRE_ABSORB"))
+    if os.environ.get("QTA_SABRE_COMMUTE"):
+        return "commute_absorb" if absorb else "on"
+    return "absorb" if absorb else "off"
+
+
 def get_backend(name: str, dry_run: bool):
     return get_device(name) if dry_run else QiskitRuntimeService().backend(name)
 
 
 def compile_mode(args) -> None:
-    mode = "on" if os.environ.get("QTA_SABRE_COMMUTE") else "off"
+    mode = mode_name()
     backend = get_backend(args.backend, args.dry_run)
-    circuits = load_suite(args.circuits_dir, [("qaoa", size) for size in args.sizes])
+    suite = [(c.rsplit("_", 1)[0], int(c.rsplit("_", 1)[1])) for c in args.circuits] if args.circuits \
+        else [("qaoa", size) for size in args.sizes]
+    circuits = load_suite(args.circuits_dir, suite)
     rows, compiled = [], []
     for cid, qc in circuits.items():
         measured = with_measurements(qc)
@@ -79,32 +89,41 @@ def best_within_budget(runs: list[tuple[str, pd.Series]], budget: float) -> tupl
     return chosen
 
 
-def choose(off: pd.DataFrame, on: pd.DataFrame) -> dict[str, tuple[str, pd.Series]]:
-    off, on = off.sort_values("seed"), on.sort_values("seed")
+def choose(off: pd.DataFrame, on: pd.DataFrame, portfolio: dict[str, pd.DataFrame] | None = None
+           ) -> dict[str, tuple[str, pd.Series]]:
+    """Best plain run and best portfolio run within the compile time of the plain block.
+
+    The portfolio cycles through its modes in the given order; by default it alternates the
+    commuting (`on`) and the plain mode.
+    """
+    portfolio = portfolio or {"on": on, "off": off}
+    off = off.sort_values("seed")
     plain_runs = [("off", r) for _, r in off.iterrows()]
     budget = off.time_s.sum()
-    alternating = [p for (_, a), (_, b) in zip(on.iterrows(), off.iterrows()) for p in (("on", a), ("off", b))]
-    return {"plain": best_within_budget(plain_runs, budget), "portfolio": best_within_budget(alternating, budget)}
+    rows = {mode: [r for _, r in frame.sort_values("seed").iterrows()] for mode, frame in portfolio.items()}
+    cycled = [(mode, rows[mode][i]) for i in range(min(map(len, rows.values()))) for mode in rows]
+    return {"plain": best_within_budget(plain_runs, budget), "portfolio": best_within_budget(cycled, budget)}
 
 
-def load_compiled(out: Path) -> dict[str, list]:
+def load_compiled(out: Path, modes=MODES) -> dict[str, list]:
     compiled = {}
-    for mode in MODES:
+    for mode in modes:
         with (out / mode / "compiled.qpy").open("rb") as f:
             compiled[mode] = qpy.load(f)
     return compiled
 
 
 def plan(args) -> None:
-    off, on = (pd.read_csv(args.out / mode / "runs.csv") for mode in MODES)
-    compiled = load_compiled(args.out)
+    off = pd.read_csv(args.out / "off" / "runs.csv")
+    modes = {mode: pd.read_csv(args.out / mode / "runs.csv") for mode in args.portfolio}
+    compiled = load_compiled(args.out, ("off", *args.portfolio))
     if args.min_esp:
         best = off.groupby("circuit").log_esp.max()
         off = off[off.circuit.isin(best[best >= np.log(args.min_esp)].index)]
     rows, submitted = [], []
     for (circuit, instance), block in off.groupby(["circuit", "instance"]):
-        other = on[(on.circuit == circuit) & (on.instance == instance)]
-        for strategy, (mode, run) in choose(block, other).items():
+        same = {mode: frame[(frame.circuit == circuit) & (frame.instance == instance)] for mode, frame in modes.items()}
+        for strategy, (mode, run) in choose(block, None, same).items():
             for repeat in range(args.repeats):
                 rows.append({"circuit": circuit, "instance": instance, "strategy": strategy, "repeat": repeat,
                              "mode": mode, "seed": int(run.seed), "n_2q": int(run.n_2q), "depth": int(run.depth),
@@ -125,7 +144,7 @@ def plan(args) -> None:
         qpy.dump(shuffled, f)
     (args.out / "shots.json").write_text(json.dumps({"shots": args.shots}))
     view = table[table.repeat == 0].groupby(["circuit", "strategy"]).agg(
-        n_2q=("n_2q", "mean"), esp=("log_esp", lambda s: float(np.exp(s).mean())), on=("mode", lambda s: int((s == "on").sum())))
+        n_2q=("n_2q", "mean"), esp=("log_esp", lambda s: float(np.exp(s).mean())), patched=("mode", lambda s: int((s != "off").sum())))
     print(view.round(3).to_string())
     print(f"{len(table)} pubs, {args.shots} shots each")
 
@@ -214,6 +233,7 @@ def main(argv=None) -> None:
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--circuits-dir", type=Path, required=True)
     c.add_argument("--sizes", type=int, nargs="+", default=[6, 8, 10, 12, 16])
+    c.add_argument("--circuits", nargs="+", help="circuit ids such as qpeexact_8; replaces --sizes")
     c.add_argument("--instances", type=int, default=3)
     c.add_argument("--block", type=int, default=20)
     c.add_argument("--dry-run", action="store_true")
@@ -225,6 +245,8 @@ def main(argv=None) -> None:
     p.add_argument("--shots", type=int, default=4000)
     p.add_argument("--min-esp", type=float, default=0.0)
     p.add_argument("--shuffle-seed", type=int, default=0)
+    p.add_argument("--portfolio", nargs="+", default=["on", "off"],
+                   help="modes the portfolio cycles through, as compiled into OUT/<mode>")
     p.set_defaults(func=plan)
     for name, func in (("send", send), ("collect", collect)):
         s = sub.add_parser(name)

@@ -28,13 +28,18 @@ def random_circuit(rng, qubits=5, size=50) -> QuantumCircuit:
     return qc
 
 
-# On the unpatched build the variable has no effect and both cases are plain level 3
+# On the unpatched build the variables have no effect and all cases are plain level 3
 @pytest.mark.parametrize("commute", [False, True])
-def test_level3_keeps_the_unitary(commute, monkeypatch):
+@pytest.mark.parametrize("absorb", [None, "1"])
+def test_level3_keeps_the_unitary(commute, absorb, monkeypatch):
     if commute:
         monkeypatch.setenv("QTA_SABRE_COMMUTE", "1")
     else:
         monkeypatch.delenv("QTA_SABRE_COMMUTE", raising=False)
+    if absorb:
+        monkeypatch.setenv("QTA_SABRE_ABSORB", absorb)
+    else:
+        monkeypatch.delenv("QTA_SABRE_ABSORB", raising=False)
     backend = GenericBackendV2(5, coupling_map=CouplingMap.from_line(5), seed=3)
     rng = np.random.default_rng(5)
     for seed in range(25):
